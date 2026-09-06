@@ -1316,6 +1316,18 @@ static const s16 rtpcs_93xx_sds_hw_mode_vals[RTPCS_SDS_MODE_MAX] = {
 	[RTPCS_SDS_MODE_USXGMII]		= RTPCS_93XX_SDS_MODE_USXGMII,
 };
 
+static bool rtpcs_93xx_sds_10gr_link_up(struct rtpcs_serdes *sds)
+{
+	int link;
+
+	/* Link status may be latched low; the second read is current state. */
+	link = rtpcs_sds_read_bits(sds, PAGE_TGR_STD_1, 0x0, 12, 12);
+	if (link < 0)
+		return false;
+
+	return rtpcs_sds_read_bits(sds, PAGE_TGR_STD_1, 0x0, 12, 12) == 1;
+}
+
 static int rtpcs_93xx_sds_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mode,
 				      const unsigned long *advertising)
 {
@@ -1963,7 +1975,7 @@ static void rtpcs_930x_sds_reset_state_machine(struct rtpcs_serdes *sds)
 static int rtpcs_930x_sds_init_state_machine(struct rtpcs_serdes *sds,
 					     enum rtpcs_sds_mode hw_mode)
 {
-	int loopback, link, cnt = 20, ret = -EBUSY;
+	int loopback, cnt = 20, ret = -EBUSY;
 
 	if (hw_mode != RTPCS_SDS_MODE_10GBASER)
 		return 0;
@@ -1978,10 +1990,7 @@ static int rtpcs_930x_sds_init_state_machine(struct rtpcs_serdes *sds,
 	while (cnt-- && ret) {
 		rtpcs_930x_sds_reset_state_machine(sds);
 
-		/* 10G link state (latched) */
-		link = rtpcs_sds_read_bits(sds, PAGE_TGR_STD_1, 0x00, 12, 12);
-		link = rtpcs_sds_read_bits(sds, PAGE_TGR_STD_1, 0x00, 12, 12);
-		if (link)
+		if (rtpcs_93xx_sds_10gr_link_up(sds))
 			ret = 0;
 	}
 
@@ -3168,11 +3177,6 @@ static int rtpcs_931x_sds_fiber_get_symerr(struct rtpcs_serdes *sds,
 	return symerr;
 }
 
-static bool rtpcs_931x_sds_10gr_link_up(struct rtpcs_serdes *sds)
-{
-	return rtpcs_sds_read_bits(sds, PAGE_TGR_STD_1, 0x0, 12, 12) == 1;
-}
-
 static void rtpcs_931x_sds_clear_symerr(struct rtpcs_serdes *sds,
 					enum rtpcs_sds_mode hw_mode)
 {
@@ -3610,7 +3614,7 @@ static void rtpcs_931x_sds_rxcal_fiber_adapt(struct rtpcs_serdes *sds)
 		rtpcs_931x_sds_clear_symerr(sds, RTPCS_SDS_MODE_10GBASER);
 		msleep(300);
 		symerr = rtpcs_931x_sds_fiber_get_symerr(sds, RTPCS_SDS_MODE_10GBASER);
-		link_up = rtpcs_931x_sds_10gr_link_up(sds);
+		link_up = rtpcs_93xx_sds_10gr_link_up(sds);
 		dev_dbg(dev, "SerDes %u symErr check %d: linkUp=%d symErr=0x%x\n", sds->id,
 			i + 1, link_up, symerr);
 
@@ -4128,18 +4132,12 @@ static int rtpcs_sds_config_polarity(struct rtpcs_serdes *sds, phy_interface_t i
 	return sds->ops->config_polarity(sds, tx_pol, rx_pol);
 }
 
-static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
-				struct phylink_link_state *state)
+static void rtpcs_pcs_get_state_mac(struct rtpcs_link *link,
+				    struct phylink_link_state *state)
 {
-	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
 	struct rtpcs_ctrl *ctrl = link->ctrl;
 	int port = link->port;
 	int linkup, speed;
-
-	state->link = 0;
-	state->speed = SPEED_UNKNOWN;
-	state->duplex = DUPLEX_UNKNOWN;
-	state->pause &= ~(MLO_PAUSE_RX | MLO_PAUSE_TX);
 
 	/* Read MAC side link twice */
 	for (int i = 0; i < 2; i++)
@@ -4188,6 +4186,62 @@ static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
 		state->pause |= MLO_PAUSE_RX;
 	if (rtpcs_regmap_read_bits(ctrl, ctrl->cfg->mac_tx_pause_sts, port, port))
 		state->pause |= MLO_PAUSE_TX;
+}
+
+/*
+ * Decode PCS state from the SerDes clause-37 / Cisco-SGMII MII regs at page 0x2.
+ * Used for SGMII, 1000BASE-X and 2500BASE-X where the standard phylink helper applies.
+ */
+static void rtpcs_pcs_get_state_c37(struct rtpcs_serdes *sds, unsigned int neg_mode,
+				    struct phylink_link_state *state)
+{
+	const struct rtpcs_config *cfg = sds->ctrl->cfg;
+	int bmsr, lpa;
+
+	/* BMSR link status may be latched low; the second read is current state. */
+	bmsr = rtpcs_sds_read(sds, cfg->phy_page, MII_BMSR);
+	if (bmsr < 0)
+		return;
+	bmsr = rtpcs_sds_read(sds, cfg->phy_page, MII_BMSR);
+	if (bmsr < 0)
+		return;
+
+	lpa = rtpcs_sds_read(sds, cfg->phy_page, MII_LPA);
+	if (lpa < 0)
+		return;
+
+	phylink_mii_c22_pcs_decode_state(state, neg_mode, bmsr, lpa);
+}
+
+/* Decode the Clause 37 modes directly and use the MAC-side mirror otherwise. */
+static void rtpcs_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
+				struct phylink_link_state *state)
+{
+	struct rtpcs_link *link = rtpcs_phylink_pcs_to_link(pcs);
+	struct rtpcs_ctrl *ctrl = link->ctrl;
+	struct rtpcs_serdes *sds = link->sds;
+
+	state->link = 0;
+	/* Forced SGMII parameters are supplied by phylink out of band. */
+	if (state->interface != PHY_INTERFACE_MODE_SGMII ||
+	    neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED) {
+		state->speed = SPEED_UNKNOWN;
+		state->duplex = DUPLEX_UNKNOWN;
+		state->pause &= ~(MLO_PAUSE_RX | MLO_PAUSE_TX);
+	}
+
+	mutex_lock(&ctrl->lock);
+	switch (sds->hw_mode) {
+	case RTPCS_SDS_MODE_SGMII:
+	case RTPCS_SDS_MODE_1000BASEX:
+	case RTPCS_SDS_MODE_2500BASEX:
+		rtpcs_pcs_get_state_c37(sds, neg_mode, state);
+		break;
+	default:
+		rtpcs_pcs_get_state_mac(link, state);
+		break;
+	}
+	mutex_unlock(&ctrl->lock);
 }
 
 static void rtpcs_pcs_an_restart(struct phylink_pcs *pcs)
