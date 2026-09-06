@@ -4210,7 +4210,7 @@ static void rtpcs_pcs_get_state_c37(struct rtpcs_serdes *sds, unsigned int neg_m
 	if (lpa < 0)
 		return;
 
-	phylink_mii_c22_pcs_decode_state(state, neg_mode, bmsr, lpa);
+	phylink_mii_c22_pcs_decode_state(state, bmsr, lpa);
 }
 
 /* Decode the Clause 37 modes directly and use the MAC-side mirror otherwise. */
